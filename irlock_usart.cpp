@@ -63,7 +63,7 @@
 #include <drivers/device/device.h>
 
 
-#define IRLOCK_DEFAULT_PORT		"/dev/ttyS8"	// telem2 on Pixhawk
+#define IRLOCK_DEFAULT_PORT		"/dev/ttyS6"	// telem2 on Pixhawk
 #define FRAME_LEN       18
 #define HEADER_LEN      4
 #define BUF_LEN 		54
@@ -102,8 +102,11 @@ public:
 	virtual ~IRLOCK();
 
 	virtual int 			init();
+	virtual int 			info();
+	virtual int 			test();
 
 	int				start();
+	void 				stop();
 
 private:
 	uint8_t _rotation;
@@ -119,8 +122,8 @@ private:
 	uint32_t _read_failures;
 	orb_advert_t _irlock_report_topic;
 
-	unsigned 	_head;
-	unsigned 	_tail;
+	uint8_t 	_head;
+	uint8_t 	_tail;
 	uint8_t 	_buf[BUF_LEN];
 
 	void read_device();
@@ -141,18 +144,20 @@ namespace
 IRLOCK	*g_irlock = nullptr;
 }
 
+void irlock_usage();
+
 IRLOCK::IRLOCK(const char *port) :
 	CDev("irlock", IRLOCK0_DEVICE_PATH),
 	_task_should_exit(false),
 	_task_handle(-1),
 	_class_instance(-1),
 	_orb_class_instance(-1),
-	_head(0),
-	_tail(0),
 	_reports(nullptr),
 	_sensor_ok(false),
 	_read_failures(0),
-	_irlock_report_topic(nullptr)
+	_irlock_report_topic(nullptr),
+	_head(0),
+	_tail(0)
 
 {
 	/* store port name */
@@ -161,7 +166,7 @@ IRLOCK::IRLOCK(const char *port) :
 	_port[sizeof(_port) - 1] = '\0';
 
 	// disable debug() calls
-	_debug_enabled = false;
+	_debug_enabled = true;
 
 	memset(&_buf[0], 0, sizeof(_buf));
 	memset(&_work, 0, sizeof(_work));
@@ -297,6 +302,71 @@ IRLOCK::start()
 	return OK;
 }
 
+/** stop periodic reads from sensor **/
+void IRLOCK::stop()
+{
+	work_cancel(HPWORK, &_work);
+}
+
+/** display driver info **/
+int IRLOCK::info()
+{
+	if (g_irlock == nullptr) {
+		errx(1, "irlock device driver is not running");
+	}
+
+	/** display reports in queue **/
+	if (_sensor_ok) {
+		_reports->print_info("report queue: ");
+		warnx("read errors:%lu", (unsigned long)_read_failures);
+
+	} else {
+		warnx("sensor is not healthy");
+	}
+
+	return OK;
+}
+
+/** test driver **/
+int IRLOCK::test()
+{
+	/** exit immediately if driver not running **/
+	if (g_irlock == nullptr) {
+		errx(1, "irlock device driver is not running");
+	}
+
+	/** exit immediately if sensor is not healty **/
+	if (!_sensor_ok) {
+		errx(1, "sensor is not healthy");
+	}
+
+	/** instructions to user **/
+	warnx("searching for object for 10 seconds");
+
+	/** read from sensor for 10 seconds **/
+	struct irlock_s report;
+	uint64_t start_time = hrt_absolute_time();
+
+	while ((hrt_absolute_time() - start_time) < 10000000) {
+		if (_reports->get(&report)) {
+			/** output all objects found **/
+			for (uint8_t i = 0; i < report.num_targets; i++) {
+				warnx("sig:%d x:%4.3f y:%4.3f width:%4.3f height:%4.3f",
+				      (int)report.targets[i].signature,
+				      (double)report.targets[i].pos_x,
+				      (double)report.targets[i].pos_y,
+				      (double)report.targets[i].size_x,
+				      (double)report.targets[i].size_y);
+			}
+		}
+
+		/** sleep for 0.05 seconds **/
+		usleep(50000);
+	}
+
+	return OK;
+}
+
 void IRLOCK::cycle_trampoline(void *arg)
 {
 	IRLOCK *device = (IRLOCK *)arg;
@@ -318,7 +388,7 @@ void IRLOCK::cycle()
 
 bool IRLOCK::is_header(uint8_t c) {
 	static uint32_t header;
-	header = header << 8 & ((uint32_t) &c)
+	header = header << 8 | ((uint32_t) c);
 	return header == IRLOCK_SYNC;
 }
 
@@ -327,7 +397,7 @@ bool IRLOCK::read_and_parse(uint8_t *buf, int len, irlock_target_s *block)
 	bool ret = false;
 
 	// write new data into a ring buffer
-	for (int i = 0; i < len; i++) {
+	for (uint8_t i = 0; i < len; i++) {
 
 		_head++;
 
@@ -343,29 +413,29 @@ bool IRLOCK::read_and_parse(uint8_t *buf, int len, irlock_target_s *block)
 	}
 
 	// check how many bytes are in the buffer, return if it's lower than the size of one package
-	int num_bytes = _head >= _tail ? (_head - _tail + 1) : (_head + 1 + BUF_LEN - _tail);
+	uint8_t num_bytes = _head >= _tail ? (_head - _tail + 1) : (_head + 1 + BUF_LEN - _tail);
 
 	if (num_bytes < FRAME_LEN) {
 		PX4_DEBUG("not enough bytes");
 		return false;
 	}
 
-	int index = _head;
+	int8_t index = _head;
 	uint8_t no_header_counter = 0;	// counter for bytes which are non header bytes
 
 	// go through the buffer backwards starting from the newest byte
 	// if we find a header byte and the previous two bytes weren't header bytes
 	// then we found the newest package.
-	for (int i = 0; i < num_bytes; i++) {
+	for (uint8_t i = 0; i < num_bytes; i++) {
 		if (is_header(_buf[index])) {
 			if (no_header_counter >= FRAME_LEN - HEADER_LEN) {
 				uint8_t frame_index = index + HEADER_LEN;
-				uint16_t checksum = bytes[GETINDEX(frame_index + 1)] << 8 | bytes[GETINDEX(frame_index + 0)];
-				uint16_t signature = bytes[GETINDEX(frame_index + 3)] << 8 | bytes[GETINDEX(frame_index + 2)];
-				uint16_t pixel_x = bytes[GETINDEX(frame_index + 5)] << 8 | bytes[GETINDEX(frame_index + 4)];
-				uint16_t pixel_y = bytes[GETINDEX(frame_index + 7)] << 8 | bytes[GETINDEX(frame_index + 6)];
-				uint16_t pixel_size_x = bytes[GETINDEX(frame_index + 9)] << 8 | bytes[GETINDEX(frame_index + 8)];
-				uint16_t pixel_size_y = bytes[GETINDEX(frame_index + 11)] << 8 | bytes[GETINDEX(frame_index + 10)];
+				uint16_t checksum = _buf[GETINDEX(frame_index + 1)] << 8 | _buf[GETINDEX(frame_index + 0)];
+				uint16_t signature = _buf[GETINDEX(frame_index + 3)] << 8 | _buf[GETINDEX(frame_index + 2)];
+				uint16_t pixel_x = _buf[GETINDEX(frame_index + 5)] << 8 | _buf[GETINDEX(frame_index + 4)];
+				uint16_t pixel_y = _buf[GETINDEX(frame_index + 7)] << 8 | _buf[GETINDEX(frame_index + 6)];
+				uint16_t pixel_size_x = _buf[GETINDEX(frame_index + 9)] << 8 | _buf[GETINDEX(frame_index + 8)];
+				uint16_t pixel_size_y = _buf[GETINDEX(frame_index + 11)] << 8 | _buf[GETINDEX(frame_index + 10)];
 
 				/** crc check **/
 				if (signature + pixel_x + pixel_y + pixel_size_x + pixel_size_y != checksum) {
@@ -428,7 +498,7 @@ IRLOCK::read_device()
 
 	while (!_task_should_exit) {
 		// wait for up to 100ms for data
-		int pret = ::poll(fds, (sizeof(fds) / sizeof(fds[0])), 100);
+		int pret = ::poll(fds, (sizeof(fds) / sizeof(fds[0])), 50);
 
 		// timed out
 		if (pret == 0) {
@@ -492,6 +562,13 @@ IRLOCK::read_device()
 	}
 
 	::close(fd);
+}
+
+void irlock_usage()
+{
+	warnx("missing command: try 'start', 'stop', 'info', 'test'");
+	warnx("options:");
+	warnx("    usart port(%d)", IRLOCK_DEFAULT_PORT);
 }
 
 int irlock_main(int argc, char *argv[])
