@@ -74,16 +74,16 @@
 #define IRLOCK_SYNC			0xAA55AA55
 
 #define IRLOCK_RES_X 320
-#define IRLOCK_RES_Y 200
+#define IRLOCK_RES_Y 240
 
 #define IRLOCK_CENTER_X				(IRLOCK_RES_X/2)			// the x-axis center pixel position
 #define IRLOCK_CENTER_Y				(IRLOCK_RES_Y/2)			// the y-axis center pixel position
 
-#define IRLOCK_FOV_X (60.0f*M_PI_F/180.0f)
-#define IRLOCK_FOV_Y (35.0f*M_PI_F/180.0f)
+#define IRLOCK_FOV_X (70.8f*M_PI_F/180.0f)
+#define IRLOCK_FOV_Y (55.6f*M_PI_F/180.0f)
 
-#define IRLOCK_TAN_HALF_FOV_X 0.57735026919f // tan(0.5 * 60 * pi/180)
-#define IRLOCK_TAN_HALF_FOV_Y 0.31529878887f // tan(0.5 * 35 * pi/180)
+#define IRLOCK_TAN_HALF_FOV_X 0.71066300938f // tan(0.5 * 60 * pi/180)
+#define IRLOCK_TAN_HALF_FOV_Y 0.52724018875f // tan(0.5 * 35 * pi/180)
 
 #define IRLOCK_TAN_ANG_PER_PIXEL_X	(2*IRLOCK_TAN_HALF_FOV_X/IRLOCK_RES_X)
 #define IRLOCK_TAN_ANG_PER_PIXEL_Y	(2*IRLOCK_TAN_HALF_FOV_Y/IRLOCK_RES_Y)
@@ -129,7 +129,7 @@ private:
 	void read_device();
 
 	/** static function that is called by worker queue, arg will be pointer to instance of this class **/
-	static void	cycle_trampoline(void *arg);
+	static void	cycle_trampoline(int argc, char *argv[]);
 
 	/** read from device and schedule next read **/
 	void		cycle();
@@ -180,8 +180,27 @@ IRLOCK::~IRLOCK()
 	}
 
 	orb_unadvertise(_irlock_report_topic);
+
+	if (_task_handle != -1) {
+		/* task wakes up every 100ms or so at the longest */
+		_task_should_exit = true;
+
+		/* wait for a second for the task to quit at our request */
+		unsigned i = 0;
+
+		do {
+			/* wait 20ms */
+			usleep(20000);
+
+			/* if we have given up, kill it */
+			if (++i > 50) {
+				px4_task_delete(_task_handle);
+				break;
+			}
+		} while (_task_handle != -1);
+	}
 	
-	work_cancel(HPWORK, &_work);
+	//work_cancel(HPWORK, &_work);
 	/** clear reports queue **/
 	if (_reports != nullptr) {
 		delete _reports;
@@ -297,7 +316,22 @@ IRLOCK::start()
 	_reports->flush();
 
 	/** start work queue cycle **/
-	work_queue(HPWORK, &_work, (worker_t)&IRLOCK::cycle_trampoline, this, 1);
+	// work_queue(HPWORK, &_work, (worker_t)&IRLOCK::cycle_trampoline, this, 20);
+
+	ASSERT(_task_handle == -1);
+
+	/* start the task */
+	_task_handle = px4_task_spawn_cmd("irlock",
+					  SCHED_DEFAULT,
+					  SCHED_PRIORITY_MAX - 30,
+					  800,
+					  (px4_main_t)&IRLOCK::cycle_trampoline,
+					  nullptr);
+
+	if (_task_handle < 0) {
+		PX4_WARN("task start failed");
+		return -errno;
+	}
 
 	return OK;
 }
@@ -305,7 +339,26 @@ IRLOCK::start()
 /** stop periodic reads from sensor **/
 void IRLOCK::stop()
 {
-	work_cancel(HPWORK, &_work);
+	//work_cancel(HPWORK, &_work);
+
+	if (_task_handle != -1) {
+		/* task wakes up every 100ms or so at the longest */
+		_task_should_exit = true;
+
+		/* wait for a second for the task to quit at our request */
+		unsigned i = 0;
+
+		do {
+			/* wait 20ms */
+			usleep(20000);
+
+			/* if we have given up, kill it */
+			if (++i > 50) {
+				px4_task_delete(_task_handle);
+				break;
+			}
+		} while (_task_handle != -1);
+	}
 }
 
 /** display driver info **/
@@ -367,13 +420,13 @@ int IRLOCK::test()
 	return OK;
 }
 
-void IRLOCK::cycle_trampoline(void *arg)
+void IRLOCK::cycle_trampoline(int argc, char *argv[])
 {
-	IRLOCK *device = (IRLOCK *)arg;
+	// IRLOCK *device = (IRLOCK *)arg;
 
 	/** check global irlock reference and cycle **/
 	if (g_irlock != nullptr) {
-		device->cycle();
+		g_irlock->cycle();
 	}
 }
 
@@ -383,7 +436,7 @@ void IRLOCK::cycle()
 	read_device();
 
 	/** schedule the next cycle **/
-	work_queue(HPWORK, &_work, (worker_t)&IRLOCK::cycle_trampoline, this, USEC2TICK(IRLOCK_CONVERSION_INTERVAL_US));
+	// work_queue(HPWORK, &_work, (worker_t)&IRLOCK::cycle_trampoline, this, USEC2TICK(IRLOCK_CONVERSION_INTERVAL_US));
 }
 
 bool IRLOCK::is_header(uint8_t c) {
@@ -497,8 +550,8 @@ IRLOCK::read_device()
 	uint8_t buf[BUF_LEN];
 
 	while (!_task_should_exit) {
-		// wait for up to 100ms for data
-		int pret = ::poll(fds, (sizeof(fds) / sizeof(fds[0])), 50);
+		// wait for up to 20ms for data
+		int pret = ::poll(fds, (sizeof(fds) / sizeof(fds[0])), 20);
 
 		// timed out
 		if (pret == 0) {
